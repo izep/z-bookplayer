@@ -102,6 +102,28 @@ public struct BookDetailView: View {
                 }
             }
             
+            // Status messages (iCloud download or playback error)
+            if player.isDownloadingFromICloud && isThisBookPlaying {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .tint(.green)
+                    Text("Downloading from iCloud Drive...")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.green)
+                }
+                .padding(.vertical, 2)
+            } else if let errorMsg = player.playbackErrorMessage, isThisBookPlaying {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(errorMsg)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .lineLimit(2)
+                }
+                .padding(.vertical, 2)
+            }
+            
             // Scrubber
             ScrubberBar(
                 currentTime: $localCurrentTime,

@@ -86,13 +86,8 @@ public class LibraryManager: ObservableObject {
     public func refreshBook(_ book: Book) async {
         guard let index = books.firstIndex(where: { $0.id == book.id }) else { return }
         
-        var isStale = false
-        guard let folderURL = try? URL(
-            resolvingBookmarkData: book.bookmarkData,
-            options: [],
-            relativeTo: nil,
-            bookmarkDataIsStale: &isStale
-        ) else {
+        let (resolvedURL, isStale) = Self.resolveFolderURL(from: book.bookmarkData)
+        guard let folderURL = resolvedURL else {
             errorMessage = "Could not resolve folder bookmark for '\(book.title)'"
             return
         }
@@ -201,8 +196,14 @@ public class LibraryManager: ObservableObject {
         for audioURL in audioURLs {
             let fileName = audioURL.lastPathComponent
             if let existing = existingMap[fileName] {
-                // Keep existing chapter and its progress
-                newChapters.append(existing)
+                var ch = existing
+                if ch.duration <= 0 {
+                    let d = await loadAudioDuration(for: audioURL)
+                    if d > 0 {
+                        ch.duration = d
+                    }
+                }
+                newChapters.append(ch)
             } else {
                 // New chapter detected!
                 let cleanTitle = formatChapterTitle(from: fileName)
@@ -245,15 +246,19 @@ public class LibraryManager: ObservableObject {
         return base.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
+    // MARK: - Resolve Folder URL Helper
+    public static func resolveFolderURL(from bookmarkData: Data) -> (url: URL?, isStale: Bool) {
+        var isStale = false
+        if let url = try? URL(resolvingBookmarkData: bookmarkData, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale) {
+            return (url, isStale)
+        }
+        return (nil, false)
+    }
+    
     // MARK: - Resolve File URL with Active Scope Access
     public func resolveURL(for book: Book, fileName: String) -> (url: URL?, stopAccess: () -> Void) {
-        var isStale = false
-        guard let folderURL = try? URL(
-            resolvingBookmarkData: book.bookmarkData,
-            options: [],
-            relativeTo: nil,
-            bookmarkDataIsStale: &isStale
-        ) else {
+        let (resolvedFolder, _) = Self.resolveFolderURL(from: book.bookmarkData)
+        guard let folderURL = resolvedFolder else {
             return (nil, {})
         }
         

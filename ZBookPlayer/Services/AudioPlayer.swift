@@ -30,6 +30,10 @@ public class AudioPlayer: ObservableObject {
     @Published public private(set) var currentBook: Book? = nil
     @Published public private(set) var currentChapter: Chapter? = nil
     
+    // Status & Error state
+    @Published public var isDownloadingFromICloud: Bool = false
+    @Published public var playbackErrorMessage: String? = nil
+    
     // Sleep timer state
     @Published public private(set) var activeSleepTimer: SleepTimerOption = .off
     @Published public private(set) var sleepTimerRemaining: TimeInterval? = nil
@@ -37,9 +41,10 @@ public class AudioPlayer: ObservableObject {
     // Internal player
     private var avPlayer: AVPlayer?
     private var timeObserverToken: Any?
+    private var playerItemStatusObserver: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
     private var activeSecurityScopedURL: URL?
-    private var cancellables = Set<AnyCancellable>()
+    private var downloadTask: Task<Void, Never>?
     
     public init() {
         setupAudioSession()
@@ -51,11 +56,12 @@ public class AudioPlayer: ObservableObject {
         if let token = timeObserverToken {
             avPlayer?.removeTimeObserver(token)
         }
+        playerItemStatusObserver?.invalidate()
         activeSecurityScopedURL?.stopAccessingSecurityScopedResource()
     }
     
     // MARK: - Audio Session Setup
-    private func setupAudioSession() {
+    public func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .spokenAudio, options: [])
@@ -72,7 +78,9 @@ public class AudioPlayer: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleInterruption(notification: notification)
+            Task { @MainActor [weak self] in
+                self?.handleInterruption(notification: notification)
+            }
         }
     }
     
@@ -100,6 +108,11 @@ public class AudioPlayer: ObservableObject {
     
     // MARK: - Playback Control
     public func playChapter(_ chapter: Chapter, in book: Book, startPosition: TimeInterval? = nil) {
+        downloadTask?.cancel()
+        downloadTask = nil
+        playbackErrorMessage = nil
+        isDownloadingFromICloud = false
+        
         // Stop current resource access if changing book
         if activeSecurityScopedURL != nil {
             activeSecurityScopedURL?.stopAccessingSecurityScopedResource()
@@ -107,39 +120,115 @@ public class AudioPlayer: ObservableObject {
         }
         
         // Resolve security-scoped folder URL
-        var isStale = false
-        guard let folderURL = try? URL(
-            resolvingBookmarkData: book.bookmarkData,
-            options: [],
-            relativeTo: nil,
-            bookmarkDataIsStale: &isStale
-        ) else {
-            print("Failed to resolve bookmark for book: \(book.title)")
+        let (folderURL, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
+        
+        guard let resolvedFolder = folderURL else {
+            playbackErrorMessage = "Could not resolve folder bookmark for '\(book.title)'"
             return
         }
         
-        guard folderURL.startAccessingSecurityScopedResource() else {
-            print("Failed to access security-scoped resource: \(folderURL)")
+        guard resolvedFolder.startAccessingSecurityScopedResource() else {
+            playbackErrorMessage = "Cannot access security-scoped folder permissions."
             return
         }
         
-        activeSecurityScopedURL = folderURL
-        
-        let fileURL = folderURL.appendingPathComponent(chapter.fileName)
-        let playerItem = AVPlayerItem(url: fileURL)
-        
-        cleanupTimeObserver()
-        
-        avPlayer = AVPlayer(playerItem: playerItem)
+        activeSecurityScopedURL = resolvedFolder
         currentBook = book
         currentChapter = chapter
         duration = chapter.duration
         
+        let sourceFileURL = resolvedFolder.appendingPathComponent(chapter.fileName)
+        
+        downloadTask = Task { @MainActor in
+            await prepareAndPlayFile(sourceURL: sourceFileURL, chapter: chapter, book: book, startPosition: startPosition)
+        }
+    }
+    
+    private func prepareAndPlayFile(sourceURL: URL, chapter: Chapter, book: Book, startPosition: TimeInterval?) async {
+        // 1. Check if the file is downloaded from iCloud Drive
+        var isReady = false
+        let fileManager = FileManager.default
+        
+        // Check ubiquitous status
+        if let values = try? sourceURL.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .fileSizeKey]) {
+            let status = values.ubiquitousItemDownloadingStatus
+            let fileSize = values.fileSize ?? 0
+            
+            if status == .notDownloaded || fileSize == 0 {
+                isDownloadingFromICloud = true
+                try? fileManager.startDownloadingUbiquitousItem(at: sourceURL)
+                
+                // Poll until downloaded or timeout (up to 30s)
+                var attempts = 0
+                while attempts < 60 && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
+                    attempts += 1
+                    
+                    if let pollValues = try? sourceURL.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .fileSizeKey]),
+                       pollValues.ubiquitousItemDownloadingStatus == .current,
+                       (pollValues.fileSize ?? 0) > 0 {
+                        isReady = true
+                        break
+                    }
+                }
+                isDownloadingFromICloud = false
+            } else {
+                isReady = true
+            }
+        } else {
+            isReady = fileManager.fileExists(atPath: sourceURL.path)
+        }
+        
+        if Task.isCancelled { return }
+        
+        // 2. Cache chapter to local application sandbox cache
+        // Playing from app sandbox cache completely prevents mediaserverd sandbox violations!
+        let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
+        try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
+        let localCachedURL = bookCacheDir.appendingPathComponent(chapter.fileName)
+        
+        var playbackURL = sourceURL
+        
+        // If source file is readable, copy to local cache
+        if isReady {
+            let shouldCopy = !fileManager.fileExists(atPath: localCachedURL.path)
+            if shouldCopy {
+                try? fileManager.copyItem(at: sourceURL, to: localCachedURL)
+            }
+            if fileManager.fileExists(atPath: localCachedURL.path) {
+                playbackURL = localCachedURL
+            }
+        }
+        
+        // 3. Load accurate duration if needed
+        let asset = AVURLAsset(url: playbackURL)
+        if let loadedDuration = try? await asset.load(.duration) {
+            let seconds = CMTimeGetSeconds(loadedDuration)
+            if seconds.isFinite && seconds > 0 {
+                self.duration = seconds
+                LibraryManager.shared.updatePlaybackProgress(
+                    bookId: book.id,
+                    chapterId: chapter.id,
+                    currentTime: chapter.currentTime,
+                    duration: seconds,
+                    isCompleted: chapter.isCompleted
+                )
+            }
+        }
+        
+        // 4. Initialize AVPlayer with the file
+        let playerItem = AVPlayerItem(asset: asset)
+        cleanupTimeObserver()
+        playerItemStatusObserver?.invalidate()
+        
+        avPlayer = AVPlayer(playerItem: playerItem)
+        
         // Resume position
         let initialTime = startPosition ?? (chapter.isCompleted ? 0 : chapter.currentTime)
-        if initialTime > 0 {
+        if initialTime > 0 && initialTime < self.duration {
             let targetCMTime = CMTime(seconds: initialTime, preferredTimescale: 600)
-            avPlayer?.seek(to: targetCMTime, toleranceBefore: .zero, toleranceAfter: .zero)
+            await avPlayer?.seek(to: targetCMTime, toleranceBefore: .zero, toleranceAfter: .zero)
             self.currentTime = initialTime
         } else {
             self.currentTime = 0
@@ -147,13 +236,36 @@ public class AudioPlayer: ObservableObject {
         
         setupTimeObserver()
         setupEndObserver(for: playerItem)
+        setupStatusObserver(for: playerItem)
         
         play()
         updateNowPlayingInfo()
     }
     
+    private func setupStatusObserver(for item: AVPlayerItem) {
+        playerItemStatusObserver = item.observe(\.status, options: [.new, .initial]) { [weak self] observedItem, _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                switch observedItem.status {
+                case .readyToPlay:
+                    self.playbackErrorMessage = nil
+                case .failed:
+                    let err = observedItem.error?.localizedDescription ?? "Playback failed"
+                    print("AVPlayerItem error: \(err)")
+                    self.playbackErrorMessage = err
+                    self.isPlaying = false
+                case .unknown:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        }
+    }
+    
     public func play() {
         guard let player = avPlayer else { return }
+        setupAudioSession()
         player.play()
         player.rate = playbackRate
         isPlaying = true
@@ -203,7 +315,6 @@ public class AudioPlayer: ObservableObject {
         let chapters = book.chapters
         guard let currentIndex = chapters.firstIndex(where: { $0.id == chapter.id }),
               currentIndex + 1 < chapters.count else {
-            // End of book
             pause()
             return
         }
@@ -214,7 +325,6 @@ public class AudioPlayer: ObservableObject {
     
     public func playPreviousChapter() {
         guard let book = currentBook, let chapter = currentChapter else { return }
-        // If > 3 seconds in, restart current chapter first
         if currentTime > 3.0 {
             seek(to: 0)
             return
@@ -252,20 +362,21 @@ public class AudioPlayer: ObservableObject {
             forInterval: interval,
             queue: .main
         ) { [weak self] time in
-            guard let self = self else { return }
-            let seconds = CMTimeGetSeconds(time)
-            if seconds.isFinite {
-                self.currentTime = seconds
-            }
-            if let currentItem = player.currentItem {
-                let itemDuration = CMTimeGetSeconds(currentItem.duration)
-                if itemDuration.isFinite && itemDuration > 0 {
-                    self.duration = itemDuration
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let seconds = CMTimeGetSeconds(time)
+                if seconds.isFinite {
+                    self.currentTime = seconds
                 }
-            }
-            // Periodic progress persistence every ~5 seconds
-            if Int(seconds) % 5 == 0 {
-                self.saveCurrentProgress()
+                if let currentItem = self.avPlayer?.currentItem {
+                    let itemDuration = CMTimeGetSeconds(currentItem.duration)
+                    if itemDuration.isFinite && itemDuration > 0 {
+                        self.duration = itemDuration
+                    }
+                }
+                if Int(seconds) % 5 == 0 {
+                    self.saveCurrentProgress()
+                }
             }
         }
     }
@@ -293,7 +404,6 @@ public class AudioPlayer: ObservableObject {
     private func handleChapterEnded() {
         guard let book = currentBook, let chapter = currentChapter else { return }
         
-        // Mark current chapter done
         LibraryManager.shared.updatePlaybackProgress(
             bookId: book.id,
             chapterId: chapter.id,
@@ -302,7 +412,6 @@ public class AudioPlayer: ObservableObject {
             isCompleted: true
         )
         
-        // Check sleep timer
         if activeSleepTimer == .endOfChapter {
             setSleepTimer(.off)
             pause()
