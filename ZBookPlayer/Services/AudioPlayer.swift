@@ -181,8 +181,12 @@ public class AudioPlayer: ObservableObject {
         
         if Task.isCancelled { return }
         
-        // 2. Cache chapter to local application sandbox cache
-        // Playing from app sandbox cache completely prevents mediaserverd sandbox violations!
+        guard isReady else {
+            playbackErrorMessage = "Chapter is still downloading from iCloud. In the Files app, you can long-press this folder and tap 'Download Now'."
+            isPlaying = false
+            return
+        }
+        
         let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
         try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
@@ -190,18 +194,16 @@ public class AudioPlayer: ObservableObject {
         
         var playbackURL = sourceURL
         
-        // If source file is readable, copy to local cache
-        if isReady {
-            let shouldCopy = !fileManager.fileExists(atPath: localCachedURL.path)
-            if shouldCopy {
-                try? fileManager.copyItem(at: sourceURL, to: localCachedURL)
-            }
-            if fileManager.fileExists(atPath: localCachedURL.path) {
-                playbackURL = localCachedURL
-            }
+        // Copy to local app cache for robust playback
+        let shouldCopy = !fileManager.fileExists(atPath: localCachedURL.path)
+        if shouldCopy {
+            try? fileManager.copyItem(at: sourceURL, to: localCachedURL)
+        }
+        if fileManager.fileExists(atPath: localCachedURL.path) {
+            playbackURL = localCachedURL
         }
         
-        // 3. Load accurate duration if needed
+        // 3. Load accurate duration
         let asset = AVURLAsset(url: playbackURL)
         if let loadedDuration = try? await asset.load(.duration) {
             let seconds = CMTimeGetSeconds(loadedDuration)
@@ -215,6 +217,12 @@ public class AudioPlayer: ObservableObject {
                     isCompleted: chapter.isCompleted
                 )
             }
+        }
+        
+        guard self.duration > 0 else {
+            playbackErrorMessage = "File has 0 duration. It may still be syncing from iCloud. Try tapping 'Download Now' on the folder in the Files app."
+            isPlaying = false
+            return
         }
         
         // 4. Initialize AVPlayer with the file
