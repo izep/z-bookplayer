@@ -8,12 +8,14 @@ public enum SleepTimerOption: Equatable {
     case off
     case minutes(Int)
     case endOfChapter
+    case endOfNextChapter
     
     public var label: String {
         switch self {
         case .off: return "Off"
         case .minutes(let m): return "\(m)m"
         case .endOfChapter: return "End of Chapter"
+        case .endOfNextChapter: return "End of Next Chapter"
         }
     }
 }
@@ -45,6 +47,23 @@ public class AudioPlayer: ObservableObject {
     private var sleepTimerTask: Task<Void, Never>?
     private var activeSecurityScopedURL: URL?
     private var downloadTask: Task<Void, Never>?
+    private var prefetchTask: Task<Void, Never>?
+    
+    // MARK: - Cache Helpers
+    nonisolated public static func cachedFileURL(for chapter: Chapter, in book: Book) -> URL {
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
+        return bookCacheDir.appendingPathComponent(chapter.fileName)
+    }
+    
+    nonisolated public static func removeCachedFile(for chapter: Chapter, in book: Book) {
+        let localCachedURL = cachedFileURL(for: chapter, in: book)
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: localCachedURL.path) {
+            try? fileManager.removeItem(at: localCachedURL)
+            print("Removed chapter from cache: \(chapter.fileName)")
+        }
+    }
     
     public init() {
         setupAudioSession()
@@ -53,6 +72,7 @@ public class AudioPlayer: ObservableObject {
     }
     
     deinit {
+        prefetchTask?.cancel()
         if let token = timeObserverToken {
             avPlayer?.removeTimeObserver(token)
         }
@@ -110,6 +130,8 @@ public class AudioPlayer: ObservableObject {
     public func playChapter(_ chapter: Chapter, in book: Book, startPosition: TimeInterval? = nil) {
         downloadTask?.cancel()
         downloadTask = nil
+        prefetchTask?.cancel()
+        prefetchTask = nil
         playbackErrorMessage = nil
         isDownloadingFromICloud = false
         
@@ -187,10 +209,9 @@ public class AudioPlayer: ObservableObject {
             return
         }
         
-        let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
+        let localCachedURL = Self.cachedFileURL(for: chapter, in: book)
+        let bookCacheDir = localCachedURL.deletingLastPathComponent()
         try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
-        let localCachedURL = bookCacheDir.appendingPathComponent(chapter.fileName)
         
         var playbackURL = sourceURL
         
@@ -248,6 +269,7 @@ public class AudioPlayer: ObservableObject {
         
         play()
         updateNowPlayingInfo()
+        prefetchNextChapter(after: chapter, in: book)
     }
     
     private func setupStatusObserver(for item: AVPlayerItem) {
@@ -310,9 +332,17 @@ public class AudioPlayer: ObservableObject {
     }
     
     public func setPlaybackRate(_ rate: Float) {
-        playbackRate = rate
+        let validRate: Float
+        if rate <= 0.95 {
+            validRate = 0.9
+        } else if rate <= 1.05 {
+            validRate = 1.0
+        } else {
+            validRate = 1.1
+        }
+        playbackRate = validRate
         if isPlaying {
-            avPlayer?.rate = rate
+            avPlayer?.rate = validRate
         }
         updateNowPlayingInfo()
     }
@@ -347,6 +377,85 @@ public class AudioPlayer: ObservableObject {
         
         let prevChapter = chapters[currentIndex - 1]
         playChapter(prevChapter, in: book, startPosition: 0)
+    }
+    
+    // MARK: - Prefetch Next Chapter
+    public func prefetchNextChapter(after chapter: Chapter, in book: Book) {
+        prefetchTask?.cancel()
+        
+        let chapters = book.chapters
+        guard let currentIndex = chapters.firstIndex(where: { $0.id == chapter.id }),
+              currentIndex + 1 < chapters.count else {
+            return
+        }
+        
+        let nextChapter = chapters[currentIndex + 1]
+        let localCachedURL = Self.cachedFileURL(for: nextChapter, in: book)
+        let fileManager = FileManager.default
+        
+        if fileManager.fileExists(atPath: localCachedURL.path) {
+            return
+        }
+        
+        prefetchTask = Task.detached(priority: .utility) {
+            let (resolvedFolder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
+            guard let folder = resolvedFolder else { return }
+            
+            let accessed = folder.startAccessingSecurityScopedResource()
+            defer {
+                if accessed {
+                    folder.stopAccessingSecurityScopedResource()
+                }
+            }
+            
+            let sourceURL = folder.appendingPathComponent(nextChapter.fileName)
+            
+            // Check ubiquitous downloading status if iCloud
+            if let values = try? sourceURL.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .fileSizeKey]) {
+                if values.ubiquitousItemDownloadingStatus == .notDownloaded || (values.fileSize ?? 0) == 0 {
+                    try? fileManager.startDownloadingUbiquitousItem(at: sourceURL)
+                    
+                    var attempts = 0
+                    while attempts < 40 && !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        attempts += 1
+                        if let poll = try? sourceURL.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .fileSizeKey]),
+                           poll.ubiquitousItemDownloadingStatus == .current,
+                           (poll.fileSize ?? 0) > 0 {
+                            break
+                        }
+                    }
+                }
+            }
+            
+            if Task.isCancelled { return }
+            
+            if fileManager.fileExists(atPath: sourceURL.path) {
+                let bookCacheDir = localCachedURL.deletingLastPathComponent()
+                try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
+                try? fileManager.copyItem(at: sourceURL, to: localCachedURL)
+                print("Prefetched next chapter into cache: \(nextChapter.fileName)")
+                
+                // If next chapter duration was unknown, compute it now
+                if nextChapter.duration <= 0 {
+                    let asset = AVURLAsset(url: localCachedURL)
+                    if let loadedDuration = try? await asset.load(.duration) {
+                        let seconds = CMTimeGetSeconds(loadedDuration)
+                        if seconds.isFinite && seconds > 0 {
+                            await MainActor.run {
+                                LibraryManager.shared.updatePlaybackProgress(
+                                    bookId: book.id,
+                                    chapterId: nextChapter.id,
+                                    currentTime: nextChapter.currentTime,
+                                    duration: seconds,
+                                    isCompleted: nextChapter.isCompleted
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     
     // MARK: - Progress Synchronization
@@ -420,10 +529,18 @@ public class AudioPlayer: ObservableObject {
             isCompleted: true
         )
         
+        // Remove finished chapter from cache
+        Self.removeCachedFile(for: chapter, in: book)
+        
         if activeSleepTimer == .endOfChapter {
             setSleepTimer(.off)
             pause()
             return
+        }
+        
+        if activeSleepTimer == .endOfNextChapter {
+            // Current chapter finished, advance timer state so it stops at the end of next chapter
+            activeSleepTimer = .endOfChapter
         }
         
         playNextChapter()
@@ -436,7 +553,7 @@ public class AudioPlayer: ObservableObject {
         activeSleepTimer = option
         
         switch option {
-        case .off, .endOfChapter:
+        case .off, .endOfChapter, .endOfNextChapter:
             sleepTimerRemaining = nil
         case .minutes(let mins):
             let totalSeconds = TimeInterval(mins * 60)

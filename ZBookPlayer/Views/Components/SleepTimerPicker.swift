@@ -27,6 +27,9 @@ public struct SleepTimerPicker: View {
             Button("End of Chapter") {
                 player.setSleepTimer(.endOfChapter)
             }
+            Button("End of Next Chapter") {
+                player.setSleepTimer(.endOfNextChapter)
+            }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "moon.fill")
@@ -36,6 +39,9 @@ public struct SleepTimerPicker: View {
                         .font(.caption.monospacedDigit().weight(.semibold))
                 } else if player.activeSleepTimer == .endOfChapter {
                     Text("End Ch")
+                        .font(.caption.weight(.semibold))
+                } else if player.activeSleepTimer == .endOfNextChapter {
+                    Text("+1 Ch")
                         .font(.caption.weight(.semibold))
                 } else {
                     Text("Timer")

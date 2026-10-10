@@ -155,14 +155,7 @@ public struct BookshelfView: View {
     private func bookCard(for book: Book) -> some View {
         HStack(spacing: 16) {
             // Book cover / Icon
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(white: 0.18))
-                Image(systemName: "headphones")
-                    .font(.system(size: 32))
-                    .foregroundColor(.green)
-            }
-            .frame(width: 72, height: 72)
+            bookCoverThumbnail(for: book)
             
             // Book information
             VStack(alignment: .leading, spacing: 6) {
@@ -212,5 +205,29 @@ public struct BookshelfView: View {
         .padding(14)
         .background(Color(red: 0.12, green: 0.16, blue: 0.23)) // slate-800
         .cornerRadius(16)
+    }
+    
+    @ViewBuilder
+    private func bookCoverThumbnail(for book: Book) -> some View {
+        let (folder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
+        let coverPath = (folder != nil && book.coverImageFileName != nil) ? folder!.appendingPathComponent(book.coverImageFileName!).path : nil
+        let uiImage = coverPath != nil ? UIImage(contentsOfFile: coverPath!) : nil
+        
+        if let image = uiImage {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 72, height: 72)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(white: 0.18))
+                Image(systemName: "headphones")
+                    .font(.system(size: 32))
+                    .foregroundColor(.green)
+            }
+            .frame(width: 72, height: 72)
+        }
     }
 }

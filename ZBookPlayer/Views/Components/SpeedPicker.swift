@@ -2,7 +2,17 @@ import SwiftUI
 
 public struct SpeedPicker: View {
     @Binding public var currentSpeed: Float
-    public let speeds: [Float] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    public struct SpeedOption: Identifiable {
+        public let rate: Float
+        public let label: String
+        public var id: Float { rate }
+    }
+    
+    public let options: [SpeedOption] = [
+        SpeedOption(rate: 0.9, label: "-10%"),
+        SpeedOption(rate: 1.0, label: "Normal"),
+        SpeedOption(rate: 1.1, label: "+10%")
+    ]
     public let onChange: (Float) -> Void
     
     public init(currentSpeed: Binding<Float>, onChange: @escaping (Float) -> Void) {
@@ -12,13 +22,13 @@ public struct SpeedPicker: View {
     
     public var body: some View {
         HStack(spacing: 6) {
-            ForEach(speeds, id: \.self) { speed in
-                let isSelected = abs(currentSpeed - speed) < 0.05
+            ForEach(options) { option in
+                let isSelected = abs(currentSpeed - option.rate) < 0.05
                 Button {
-                    currentSpeed = speed
-                    onChange(speed)
+                    currentSpeed = option.rate
+                    onChange(option.rate)
                 } label: {
-                    Text(formatSpeed(speed))
+                    Text(option.label)
                         .font(.caption.weight(isSelected ? .bold : .medium))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -28,14 +38,6 @@ public struct SpeedPicker: View {
                 }
                 .buttonStyle(.plain)
             }
-        }
-    }
-    
-    private func formatSpeed(_ speed: Float) -> String {
-        if speed == floor(speed) {
-            return String(format: "%.0fx", speed)
-        } else {
-            return String(format: "%.2gx", speed)
         }
     }
 }

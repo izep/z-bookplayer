@@ -122,6 +122,11 @@ public class LibraryManager: ObservableObject {
     public func deleteBook(_ book: Book) {
         books.removeAll { $0.id == book.id }
         saveBooks()
+        
+        // Remove all cached audio files for this book
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
+        try? FileManager.default.removeItem(at: bookCacheDir)
     }
     
     public func updatePlaybackProgress(
@@ -152,13 +157,15 @@ public class LibraryManager: ObservableObject {
         books[bIndex].chapters[cIndex].isCompleted = completed
         if completed {
             books[bIndex].chapters[cIndex].currentTime = books[bIndex].chapters[cIndex].duration
+            // Remove completed chapter from local cache
+            AudioPlayer.removeCachedFile(for: books[bIndex].chapters[cIndex], in: books[bIndex])
         } else {
             books[bIndex].chapters[cIndex].currentTime = 0
         }
         saveBooks()
     }
     
-    // MARK: - Scan Folder
+    // MARK: - Scan Folder & Validate Cache
     private func scanFolderContents(folderURL: URL, book: inout Book) async {
         let fileManager = FileManager.default
         let supportedExtensions = Set(["mp3", "m4a", "m4b", "aac", "wav"])
@@ -188,6 +195,9 @@ public class LibraryManager: ObservableObject {
         }
         
         book.coverImageFileName = coverFileName
+        
+        // Check cached versions against source to remove outdated or orphaned files
+        await validateAndCleanCache(folderURL: folderURL, book: book, audioURLs: audioURLs)
         
         // Existing chapter map for keeping progress
         let existingMap = Dictionary(uniqueKeysWithValues: book.chapters.map { ($0.fileName, $0) })
@@ -224,6 +234,56 @@ public class LibraryManager: ObservableObject {
         book.chapters = newChapters
     }
     
+    // MARK: - Cache Validation
+    private func validateAndCleanCache(folderURL: URL, book: Book, audioURLs: [URL]) async {
+        let fileManager = FileManager.default
+        let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
+        
+        guard let cachedFiles = try? fileManager.contentsOfDirectory(atPath: bookCacheDir.path) else {
+            return
+        }
+        
+        let sourceURLMap = Dictionary(uniqueKeysWithValues: audioURLs.map { ($0.lastPathComponent, $0) })
+        
+        for cachedFileName in cachedFiles {
+            let cachedURL = bookCacheDir.appendingPathComponent(cachedFileName)
+            
+            // 1. Orphaned cache check: If source file no longer exists, remove cached file
+            guard let sourceURL = sourceURLMap[cachedFileName] else {
+                try? fileManager.removeItem(at: cachedURL)
+                print("Removed orphaned cached chapter: \(cachedFileName)")
+                continue
+            }
+            
+            // 2. New version check: Compare modification date and file size
+            let sourceValues = try? sourceURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let cacheValues = try? cachedURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            
+            var needsRemoval = false
+            
+            if let sourceDate = sourceValues?.contentModificationDate,
+               let cacheDate = cacheValues?.contentModificationDate {
+                if sourceDate > cacheDate.addingTimeInterval(1.0) {
+                    needsRemoval = true
+                }
+            }
+            
+            if let sourceSize = sourceValues?.fileSize,
+               let cacheSize = cacheValues?.fileSize,
+               sourceSize > 0, cacheSize > 0 {
+                if sourceSize != cacheSize {
+                    needsRemoval = true
+                }
+            }
+            
+            if needsRemoval {
+                try? fileManager.removeItem(at: cachedURL)
+                print("Removed outdated cached chapter: \(cachedFileName) (new version available on source)")
+            }
+        }
+    }
+    
     private func loadAudioDuration(for url: URL) async -> TimeInterval {
         let asset = AVURLAsset(url: url)
         do {
@@ -247,7 +307,7 @@ public class LibraryManager: ObservableObject {
     }
     
     // MARK: - Resolve Folder URL Helper
-    public static func resolveFolderURL(from bookmarkData: Data) -> (url: URL?, isStale: Bool) {
+    nonisolated public static func resolveFolderURL(from bookmarkData: Data) -> (url: URL?, isStale: Bool) {
         var isStale = false
         if let url = try? URL(resolvingBookmarkData: bookmarkData, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale) {
             return (url, isStale)

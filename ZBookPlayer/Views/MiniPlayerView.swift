@@ -12,13 +12,7 @@ public struct MiniPlayerView: View {
         if let chapter = player.currentChapter, let book = player.currentBook {
             HStack(spacing: 12) {
                 // Book cover thumbnail or placeholder
-                ZStack {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(white: 0.2))
-                    Image(systemName: "book.closed.fill")
-                        .foregroundColor(.green)
-                }
-                .frame(width: 42, height: 42)
+                miniCoverThumbnail(for: book)
                 
                 // Chapter & Book Titles
                 VStack(alignment: .leading, spacing: 2) {
@@ -66,6 +60,29 @@ public struct MiniPlayerView: View {
             .onTapGesture {
                 onTap()
             }
+        }
+    }
+    
+    @ViewBuilder
+    private func miniCoverThumbnail(for book: Book) -> some View {
+        let (folder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
+        let coverPath = (folder != nil && book.coverImageFileName != nil) ? folder!.appendingPathComponent(book.coverImageFileName!).path : nil
+        let uiImage = coverPath != nil ? UIImage(contentsOfFile: coverPath!) : nil
+        
+        if let image = uiImage {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 42, height: 42)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(white: 0.2))
+                Image(systemName: "book.closed.fill")
+                    .foregroundColor(.green)
+            }
+            .frame(width: 42, height: 42)
         }
     }
 }

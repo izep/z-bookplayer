@@ -12,12 +12,17 @@ A lightweight, native iOS audiobook player built with SwiftUI and AVFoundation d
   - Smooth interactive scrubber with elapsed and total duration.
   - Skip buttons: **-15s** and **+30s**.
   - Previous / Next chapter navigation with automatic sequential playback.
-  - Speed selector pills: `0.75x`, `1.0x`, `1.25x`, `1.5x`, `1.75x`, `2.0x`.
-  - Sleep timer: `15m`, `30m`, `45m`, `60m`, and **End of Chapter** with a live countdown display.
+  - Speed selector pills: **-10%** (0.9x), **Normal** (1.0x), and **+10%** (1.1x).
+  - Sleep timer: `15m`, `30m`, `45m`, `60m`, **End of Chapter**, and **End of Next Chapter** with a live status badge.
+- **Intelligent Cache & Prefetching**:
+  - **Auto-Cleanup**: Chapters are automatically removed from local device cache as soon as playback finishes or when marked completed, preserving iPhone disk space.
+  - **Background Prefetch**: While listening to a chapter, the player automatically prefetches the next chapter into cache in the background for zero-latency, gapless playback.
+  - **Cache Validation on Refresh**: Pulling to refresh verifies cached files against iCloud source files by modification date and file size; any re-synthesized chapters automatically purge stale cache and reload.
 - **Background & Lock Screen Integration**:
   - `AVAudioSession` background audio playback.
   - Full `MPNowPlayingInfoCenter` and `MPRemoteCommandCenter` integration (Lock screen scrubber, play/pause, skip -15s/+30s, and chapter controls).
 - **Library & Progress Tracking**:
+  - Displays real book cover art thumbnails in bookshelf and mini player.
   - Track listening progress per chapter and overall book completion percentage.
   - Mark chapters as completed (`✓ Done`) or unplayed.
   - Filter by `All` vs `Unplayed` and instant search by chapter number or title.
