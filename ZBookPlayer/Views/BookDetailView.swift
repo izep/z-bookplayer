@@ -80,24 +80,40 @@ public struct BookDetailView: View {
         let activeChapter = isThisBookPlaying ? player.currentChapter : book.currentChapter
         
         VStack(spacing: 14) {
-            // Chapter info
-            VStack(alignment: .leading, spacing: 4) {
-                Text(activeChapter?.title ?? "No Chapter Selected")
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .lineLimit(2)
+            // Chapter info with active volume cover thumbnail
+            HStack(alignment: .top, spacing: 12) {
+                if let coverImg = library.coverImage(for: book, chapter: activeChapter) {
+                    Image(uiImage: coverImg)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 54, height: 54)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
                 
-                HStack {
-                    if let chapter = activeChapter {
-                        Text("Chapter Progress: \(Int(chapter.progress * 100))%")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    if let volName = activeChapter?.volumeName {
+                        Text(volName.uppercased())
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(.green)
                     }
-                    Spacer()
-                    if let book = self.book {
-                        Text("\(book.completedChaptersCount) / \(book.chapters.count) Done")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    
+                    Text(activeChapter?.title ?? "No Chapter Selected")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                    
+                    HStack {
+                        if let chapter = activeChapter {
+                            Text("Chapter: \(Int(chapter.progress * 100))%")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        if let book = self.book {
+                            Text("\(book.completedChaptersCount) / \(book.chapters.count) Done")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
             }
@@ -271,6 +287,16 @@ public struct BookDetailView: View {
                     // Chapter title & details
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
+                            if let vol = chapter.volumeName {
+                                Text(vol)
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color(white: 0.2))
+                                    .foregroundColor(.green)
+                                    .cornerRadius(4)
+                            }
+                            
                             Text(chapter.title)
                                 .font(.body.weight(isCurrent ? .bold : .regular))
                                 .foregroundColor(isCurrent ? .green : .white)

@@ -187,31 +187,95 @@ public class LibraryManager: ObservableObject {
         
         guard let items = try? fileManager.contentsOfDirectory(
             at: folderURL,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {
             return
         }
         
-        var audioURLs: [URL] = []
-        var coverFileName: String? = nil
+        struct ScannedItem {
+            let url: URL
+            let relativePath: String
+            let volumeName: String?
+            let volumeOrder: Double?
+            let volumeCover: String?
+        }
         
+        var scannedAudios: [ScannedItem] = []
+        var rootCoverFileName: String? = nil
+        
+        // Scan items in root folder
         for item in items {
-            let ext = item.pathExtension.lowercased()
-            if supportedExtensions.contains(ext) {
-                audioURLs.append(item)
-            } else if imageExtensions.contains(ext) {
-                let name = item.deletingPathExtension().lastPathComponent.lowercased()
-                if name.contains("cover") || name.contains("folder") || coverFileName == nil {
-                    coverFileName = item.lastPathComponent
+            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir {
+                // This is a subfolder (e.g. "Book 1", "Book 2")
+                let subfolderName = item.lastPathComponent
+                let volOrder = parseVolumeOrder(from: subfolderName)
+                
+                if let subItems = try? fileManager.contentsOfDirectory(
+                    at: item,
+                    includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                ) {
+                    var subCoverName: String? = nil
+                    for subItem in subItems {
+                        let ext = subItem.pathExtension.lowercased()
+                        if imageExtensions.contains(ext) {
+                            let name = subItem.deletingPathExtension().lastPathComponent.lowercased()
+                            if name.contains("cover") || name.contains("folder") || subCoverName == nil {
+                                subCoverName = "\(subfolderName)/\(subItem.lastPathComponent)"
+                            }
+                        }
+                    }
+                    
+                    // Cache subfolder cover if found
+                    if let subCover = subCoverName {
+                        let subCoverSource = folderURL.appendingPathComponent(subCover)
+                        let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                        let localCover = cachesDir.appendingPathComponent(book.id.uuidString).appendingPathComponent(subCover)
+                        try? fileManager.createDirectory(at: localCover.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        if !fileManager.fileExists(atPath: localCover.path) && fileManager.fileExists(atPath: subCoverSource.path) {
+                            try? fileManager.copyItem(at: subCoverSource, to: localCover)
+                        }
+                    }
+                    
+                    for subItem in subItems {
+                        let ext = subItem.pathExtension.lowercased()
+                        if supportedExtensions.contains(ext) {
+                            let relPath = "\(subfolderName)/\(subItem.lastPathComponent)"
+                            scannedAudios.append(ScannedItem(
+                                url: subItem,
+                                relativePath: relPath,
+                                volumeName: subfolderName,
+                                volumeOrder: volOrder,
+                                volumeCover: subCoverName
+                            ))
+                        }
+                    }
+                }
+            } else {
+                let ext = item.pathExtension.lowercased()
+                if supportedExtensions.contains(ext) {
+                    scannedAudios.append(ScannedItem(
+                        url: item,
+                        relativePath: item.lastPathComponent,
+                        volumeName: nil,
+                        volumeOrder: nil,
+                        volumeCover: nil
+                    ))
+                } else if imageExtensions.contains(ext) {
+                    let name = item.deletingPathExtension().lastPathComponent.lowercased()
+                    if name.contains("cover") || name.contains("folder") || rootCoverFileName == nil {
+                        rootCoverFileName = item.lastPathComponent
+                    }
                 }
             }
         }
         
-        book.coverImageFileName = coverFileName
+        book.coverImageFileName = rootCoverFileName
         
-        // Cache cover image locally in sandbox so UI doesn't need security-scoped access
-        if let coverName = coverFileName {
+        // Cache root cover
+        if let coverName = rootCoverFileName {
             let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
             try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
@@ -223,18 +287,22 @@ public class LibraryManager: ObservableObject {
         }
         
         // Check cached versions against source to remove outdated or orphaned files
-        await validateAndCleanCache(folderURL: folderURL, book: book, audioURLs: audioURLs)
+        let justURLs = scannedAudios.map { $0.url }
+        await validateAndCleanCache(folderURL: folderURL, book: book, audioURLs: justURLs)
         
         // Existing chapter map for keeping progress
         let existingMap = Dictionary(uniqueKeysWithValues: book.chapters.map { ($0.fileName, $0) })
         var newChapters: [Chapter] = []
         
-        for audioURL in audioURLs {
-            let fileName = audioURL.lastPathComponent
-            if let existing = existingMap[fileName] {
+        for item in scannedAudios {
+            let relPath = item.relativePath
+            if let existing = existingMap[relPath] {
                 var ch = existing
+                if ch.volumeName == nil { ch.volumeName = item.volumeName }
+                if ch.volumeOrder == nil { ch.volumeOrder = item.volumeOrder }
+                if ch.volumeCoverFileName == nil { ch.volumeCoverFileName = item.volumeCover }
                 if ch.duration <= 0 {
-                    let d = await loadAudioDuration(for: audioURL)
+                    let d = await loadAudioDuration(for: item.url)
                     if d > 0 {
                         ch.duration = d
                     }
@@ -242,22 +310,38 @@ public class LibraryManager: ObservableObject {
                 newChapters.append(ch)
             } else {
                 // New chapter detected!
-                let cleanTitle = formatChapterTitle(from: fileName)
-                let duration = await loadAudioDuration(for: audioURL)
+                let cleanTitle = formatChapterTitle(from: item.url.lastPathComponent)
+                let duration = await loadAudioDuration(for: item.url)
                 let newChapter = Chapter(
-                    fileName: fileName,
+                    fileName: relPath,
                     title: cleanTitle,
                     duration: duration,
                     currentTime: 0,
-                    isCompleted: false
+                    isCompleted: false,
+                    volumeName: item.volumeName,
+                    volumeOrder: item.volumeOrder,
+                    volumeCoverFileName: item.volumeCover
                 )
                 newChapters.append(newChapter)
             }
         }
         
-        // Sort naturally
+        // Sort naturally (by volume then chapter number)
         newChapters.sort(by: Chapter.naturalSortCompare)
         book.chapters = newChapters
+    }
+    
+    private func parseVolumeOrder(from name: String) -> Double? {
+        let pattern = #"(?:book|volume|vol|b|v)\s*([0-9]+(?:\.[0-9]+)?)"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+            let ns = name as NSString
+            let matches = regex.matches(in: name, range: NSRange(location: 0, length: ns.length))
+            if let m = matches.first, m.numberOfRanges > 1 {
+                let s = ns.substring(with: m.range(at: 1))
+                return Double(s)
+            }
+        }
+        return nil
     }
     
     // MARK: - Cache Validation
@@ -364,9 +448,11 @@ public class LibraryManager: ObservableObject {
         return (fileURL, stopBlock)
     }
     
-    // MARK: - Cover Image Helper
-    public func coverImage(for book: Book) -> UIImage? {
-        guard let coverName = book.coverImageFileName else { return nil }
+    // MARK: - Cover Image Helper (dynamically switches per volume)
+    public func coverImage(for book: Book, chapter: Chapter? = nil) -> UIImage? {
+        let activeChapter = chapter ?? book.currentChapter
+        let coverName = activeChapter?.volumeCoverFileName ?? book.coverImageFileName
+        guard let coverName = coverName else { return nil }
         
         let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         let localCoverURL = cachesDir.appendingPathComponent(book.id.uuidString).appendingPathComponent(coverName)
@@ -392,6 +478,15 @@ public class LibraryManager: ObservableObject {
             try? FileManager.default.copyItem(at: sourceURL, to: localCoverURL)
             return image
         }
+        
+        // If volume cover failed to load, fallback to root book cover
+        if coverName != book.coverImageFileName, let rootName = book.coverImageFileName {
+            let rootCoverURL = cachesDir.appendingPathComponent(book.id.uuidString).appendingPathComponent(rootName)
+            if let rootImg = UIImage(contentsOfFile: rootCoverURL.path) {
+                return rootImg
+            }
+        }
+        
         return nil
     }
 }
