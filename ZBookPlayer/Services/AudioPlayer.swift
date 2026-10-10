@@ -141,35 +141,52 @@ public class AudioPlayer: ObservableObject {
             activeSecurityScopedURL = nil
         }
         
-        // Resolve security-scoped folder URL
-        let (folderURL, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
-        
-        guard let resolvedFolder = folderURL else {
-            playbackErrorMessage = "Could not resolve folder bookmark for '\(book.title)'"
-            return
-        }
-        
-        guard resolvedFolder.startAccessingSecurityScopedResource() else {
-            playbackErrorMessage = "Cannot access security-scoped folder permissions."
-            return
-        }
-        
-        activeSecurityScopedURL = resolvedFolder
         currentBook = book
         currentChapter = chapter
         duration = chapter.duration
         
-        let sourceFileURL = resolvedFolder.appendingPathComponent(chapter.fileName)
+        let localCachedURL = Self.cachedFileURL(for: chapter, in: book)
+        
+        // 1. If file is already in the local cache, play immediately with NO security scope needed!
+        if FileManager.default.fileExists(atPath: localCachedURL.path) {
+            downloadTask = Task { @MainActor in
+                await startPlayback(playbackURL: localCachedURL, chapter: chapter, book: book, startPosition: startPosition)
+            }
+            return
+        }
+        
+        // 2. Resolve folder URL
+        let (folderURL, isStale) = LibraryManager.resolveFolderURL(from: book.bookmarkData, fallbackPath: book.folderPath)
+        
+        guard let resolvedFolder = folderURL else {
+            playbackErrorMessage = "Could not locate audio folder for '\(book.title)'"
+            return
+        }
+        
+        if isStale {
+            if let newBookmark = try? resolvedFolder.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                LibraryManager.shared.updateBookmark(for: book.id, newBookmark: newBookmark, newPath: resolvedFolder.path)
+            }
+        }
         
         downloadTask = Task { @MainActor in
-            await prepareAndPlayFile(sourceURL: sourceFileURL, chapter: chapter, book: book, startPosition: startPosition)
+            await prepareFromSourceAndPlay(folderURL: resolvedFolder, chapter: chapter, book: book, startPosition: startPosition)
         }
     }
     
-    private func prepareAndPlayFile(sourceURL: URL, chapter: Chapter, book: Book, startPosition: TimeInterval?) async {
+    private func prepareFromSourceAndPlay(folderURL: URL, chapter: Chapter, book: Book, startPosition: TimeInterval?) async {
+        let accessed = folderURL.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                folderURL.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        let sourceURL = folderURL.appendingPathComponent(chapter.fileName)
+        let fileManager = FileManager.default
+        
         // 1. Check if the file is downloaded from iCloud Drive
         var isReady = false
-        let fileManager = FileManager.default
         
         // Check ubiquitous status
         if let values = try? sourceURL.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .fileSizeKey]) {
@@ -213,18 +230,25 @@ public class AudioPlayer: ObservableObject {
         let bookCacheDir = localCachedURL.deletingLastPathComponent()
         try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
         
-        var playbackURL = sourceURL
-        
-        // Copy to local app cache for robust playback
-        let shouldCopy = !fileManager.fileExists(atPath: localCachedURL.path)
-        if shouldCopy {
+        // Copy to local app cache for robust, permission-free playback
+        if !fileManager.fileExists(atPath: localCachedURL.path) {
             try? fileManager.copyItem(at: sourceURL, to: localCachedURL)
         }
-        if fileManager.fileExists(atPath: localCachedURL.path) {
-            playbackURL = localCachedURL
+        
+        var playbackURL = localCachedURL
+        if !fileManager.fileExists(atPath: localCachedURL.path) {
+            // If copy failed, fallback to source directly
+            playbackURL = sourceURL
+            if accessed {
+                activeSecurityScopedURL = folderURL
+            }
         }
         
-        // 3. Load accurate duration
+        await startPlayback(playbackURL: playbackURL, chapter: chapter, book: book, startPosition: startPosition)
+    }
+    
+    private func startPlayback(playbackURL: URL, chapter: Chapter, book: Book, startPosition: TimeInterval?) async {
+        // Load accurate duration
         let asset = AVURLAsset(url: playbackURL)
         if let loadedDuration = try? await asset.load(.duration) {
             let seconds = CMTimeGetSeconds(loadedDuration)
@@ -246,7 +270,7 @@ public class AudioPlayer: ObservableObject {
             return
         }
         
-        // 4. Initialize AVPlayer with the file
+        // Initialize AVPlayer with the file
         let playerItem = AVPlayerItem(asset: asset)
         cleanupTimeObserver()
         playerItemStatusObserver?.invalidate()
@@ -398,7 +422,7 @@ public class AudioPlayer: ObservableObject {
         }
         
         prefetchTask = Task.detached(priority: .utility) {
-            let (resolvedFolder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
+            let (resolvedFolder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData, fallbackPath: book.folderPath)
             guard let folder = resolvedFolder else { return }
             
             let accessed = folder.startAccessingSecurityScopedResource()
@@ -640,12 +664,9 @@ public class AudioPlayer: ObservableObject {
         info[MPMediaItemPropertyPlaybackDuration] = duration
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? playbackRate : 0.0
         
-        if let book = currentBook, let coverName = book.coverImageFileName,
-           let folder = activeSecurityScopedURL {
-            let coverURL = folder.appendingPathComponent(coverName)
-            if let image = UIImage(contentsOfFile: coverURL.path) {
-                info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-            }
+        if let book = currentBook,
+           let image = LibraryManager.shared.coverImage(for: book) {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
         }
         
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info

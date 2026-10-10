@@ -61,6 +61,7 @@ public class LibraryManager: ObservableObject {
             // Check if book with this title already exists
             if let existingIndex = books.firstIndex(where: { $0.title == bookTitle }) {
                 books[existingIndex].bookmarkData = bookmark
+                books[existingIndex].folderPath = folderURL.path
                 await refreshBook(books[existingIndex])
                 isScanning = false
                 return
@@ -68,7 +69,8 @@ public class LibraryManager: ObservableObject {
             
             var newBook = Book(
                 title: bookTitle,
-                bookmarkData: bookmark
+                bookmarkData: bookmark,
+                folderPath: folderURL.path
             )
             
             await scanFolderContents(folderURL: folderURL, book: &newBook)
@@ -86,7 +88,7 @@ public class LibraryManager: ObservableObject {
     public func refreshBook(_ book: Book) async {
         guard let index = books.firstIndex(where: { $0.id == book.id }) else { return }
         
-        let (resolvedURL, isStale) = Self.resolveFolderURL(from: book.bookmarkData)
+        let (resolvedURL, isStale) = Self.resolveFolderURL(from: book.bookmarkData, fallbackPath: book.folderPath)
         guard let folderURL = resolvedURL else {
             errorMessage = "Could not resolve folder bookmark for '\(book.title)'"
             return
@@ -102,12 +104,24 @@ public class LibraryManager: ObservableObject {
         if isStale {
             if let newBookmark = try? folderURL.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
                 books[index].bookmarkData = newBookmark
+                books[index].folderPath = folderURL.path
             }
+        } else if books[index].folderPath == nil {
+            books[index].folderPath = folderURL.path
         }
         
         var updatedBook = books[index]
         await scanFolderContents(folderURL: folderURL, book: &updatedBook)
         books[index] = updatedBook
+        saveBooks()
+    }
+    
+    public func updateBookmark(for bookId: UUID, newBookmark: Data, newPath: String? = nil) {
+        guard let index = books.firstIndex(where: { $0.id == bookId }) else { return }
+        books[index].bookmarkData = newBookmark
+        if let newPath = newPath {
+            books[index].folderPath = newPath
+        }
         saveBooks()
     }
     
@@ -195,6 +209,18 @@ public class LibraryManager: ObservableObject {
         }
         
         book.coverImageFileName = coverFileName
+        
+        // Cache cover image locally in sandbox so UI doesn't need security-scoped access
+        if let coverName = coverFileName {
+            let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            let bookCacheDir = cachesDir.appendingPathComponent(book.id.uuidString)
+            try? fileManager.createDirectory(at: bookCacheDir, withIntermediateDirectories: true)
+            let localCoverURL = bookCacheDir.appendingPathComponent(coverName)
+            let sourceCoverURL = folderURL.appendingPathComponent(coverName)
+            if !fileManager.fileExists(atPath: localCoverURL.path) && fileManager.fileExists(atPath: sourceCoverURL.path) {
+                try? fileManager.copyItem(at: sourceCoverURL, to: localCoverURL)
+            }
+        }
         
         // Check cached versions against source to remove outdated or orphaned files
         await validateAndCleanCache(folderURL: folderURL, book: book, audioURLs: audioURLs)
@@ -307,17 +333,21 @@ public class LibraryManager: ObservableObject {
     }
     
     // MARK: - Resolve Folder URL Helper
-    nonisolated public static func resolveFolderURL(from bookmarkData: Data) -> (url: URL?, isStale: Bool) {
+    nonisolated public static func resolveFolderURL(from bookmarkData: Data, fallbackPath: String? = nil) -> (url: URL?, isStale: Bool) {
         var isStale = false
         if let url = try? URL(resolvingBookmarkData: bookmarkData, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale) {
             return (url, isStale)
+        }
+        if let path = fallbackPath, !path.isEmpty {
+            let url = URL(fileURLWithPath: path)
+            return (url, false)
         }
         return (nil, false)
     }
     
     // MARK: - Resolve File URL with Active Scope Access
     public func resolveURL(for book: Book, fileName: String) -> (url: URL?, stopAccess: () -> Void) {
-        let (resolvedFolder, _) = Self.resolveFolderURL(from: book.bookmarkData)
+        let (resolvedFolder, _) = Self.resolveFolderURL(from: book.bookmarkData, fallbackPath: book.folderPath)
         guard let folderURL = resolvedFolder else {
             return (nil, {})
         }
@@ -332,5 +362,36 @@ public class LibraryManager: ObservableObject {
         }
         
         return (fileURL, stopBlock)
+    }
+    
+    // MARK: - Cover Image Helper
+    public func coverImage(for book: Book) -> UIImage? {
+        guard let coverName = book.coverImageFileName else { return nil }
+        
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let localCoverURL = cachesDir.appendingPathComponent(book.id.uuidString).appendingPathComponent(coverName)
+        if let image = UIImage(contentsOfFile: localCoverURL.path) {
+            return image
+        }
+        
+        // Fallback to resolving source folder
+        let (resolvedFolder, _) = Self.resolveFolderURL(from: book.bookmarkData, fallbackPath: book.folderPath)
+        guard let folder = resolvedFolder else { return nil }
+        
+        let accessed = folder.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                folder.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        let sourceURL = folder.appendingPathComponent(coverName)
+        if let image = UIImage(contentsOfFile: sourceURL.path) {
+            // Also save to cache for subsequent zero-permission loads
+            try? FileManager.default.createDirectory(at: localCoverURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: sourceURL, to: localCoverURL)
+            return image
+        }
+        return nil
     }
 }

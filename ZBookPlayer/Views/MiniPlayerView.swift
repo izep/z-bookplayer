@@ -65,11 +65,7 @@ public struct MiniPlayerView: View {
     
     @ViewBuilder
     private func miniCoverThumbnail(for book: Book) -> some View {
-        let (folder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
-        let coverPath = (folder != nil && book.coverImageFileName != nil) ? folder!.appendingPathComponent(book.coverImageFileName!).path : nil
-        let uiImage = coverPath != nil ? UIImage(contentsOfFile: coverPath!) : nil
-        
-        if let image = uiImage {
+        if let image = LibraryManager.shared.coverImage(for: book) {
             Image(uiImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)

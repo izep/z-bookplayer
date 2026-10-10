@@ -209,11 +209,7 @@ public struct BookshelfView: View {
     
     @ViewBuilder
     private func bookCoverThumbnail(for book: Book) -> some View {
-        let (folder, _) = LibraryManager.resolveFolderURL(from: book.bookmarkData)
-        let coverPath = (folder != nil && book.coverImageFileName != nil) ? folder!.appendingPathComponent(book.coverImageFileName!).path : nil
-        let uiImage = coverPath != nil ? UIImage(contentsOfFile: coverPath!) : nil
-        
-        if let image = uiImage {
+        if let image = library.coverImage(for: book) {
             Image(uiImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)

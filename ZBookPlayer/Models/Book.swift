@@ -4,6 +4,7 @@ public struct Book: Identifiable, Codable, Equatable, Hashable {
     public let id: UUID
     public var title: String
     public var bookmarkData: Data
+    public var folderPath: String?
     public var coverImageFileName: String?
     public var chapters: [Chapter]
     public var lastPlayedChapterId: String?
@@ -13,6 +14,7 @@ public struct Book: Identifiable, Codable, Equatable, Hashable {
         id: UUID = UUID(),
         title: String,
         bookmarkData: Data,
+        folderPath: String? = nil,
         coverImageFileName: String? = nil,
         chapters: [Chapter] = [],
         lastPlayedChapterId: String? = nil,
@@ -21,6 +23,7 @@ public struct Book: Identifiable, Codable, Equatable, Hashable {
         self.id = id
         self.title = title
         self.bookmarkData = bookmarkData
+        self.folderPath = folderPath
         self.coverImageFileName = coverImageFileName
         self.chapters = chapters
         self.lastPlayedChapterId = lastPlayedChapterId
